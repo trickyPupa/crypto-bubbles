@@ -2,7 +2,7 @@ name: Update YouTrack issue
 
 on:
   pull_request:
-    types: [opened, reopened, closed]
+    types: [opened, reopened, synchronize, ready_for_review, closed]
   pull_request_review:
     types: [submitted]
 
@@ -15,6 +15,7 @@ jobs:
     if: >-
       (github.event_name == 'pull_request' &&
        (github.event.action == 'opened' || github.event.action == 'reopened' ||
+        github.event.action == 'synchronize' || github.event.action == 'ready_for_review' ||
         (github.event.action == 'closed' && github.event.pull_request.merged == true))) ||
       (github.event_name == 'pull_request_review' &&
        github.event.review.state == 'approved')
@@ -56,6 +57,8 @@ jobs:
           PR_MERGED: ${{ github.event.pull_request.merged }}
         run: |
           set -eu
+          YOUTRACK_URL="$(printf '%s' "$YOUTRACK_URL" | tr -d '\r\n')"
+          YOUTRACK_TOKEN="$(printf '%s' "$YOUTRACK_TOKEN" | tr -d '\r\n')"
           ISSUE_ID="$(printf '%s\n%s' "$PR_TITLE" "$PR_BRANCH" | grep -Eo '[A-Z][A-Z0-9]+-[0-9]+' | head -n 1 || true)"
           if [ -z "$ISSUE_ID" ]; then exit 0; fi
           if [ "$EVENT_NAME" = "pull_request" ] && [ "$EVENT_ACTION" = "closed" ] && [ "$PR_MERGED" = "true" ]; then
@@ -63,10 +66,24 @@ jobs:
           elif [ "$EVENT_NAME" = "pull_request_review" ] && [ "$REVIEW_STATE" = "approved" ]; then
             STATE="Готово к тестированию"
           else
-            STATE="Готово к проверке"
+            STATE="Готово к ревью"
           fi
-          curl --fail-with-body --request POST \
-            --url "$YOUTRACK_URL/api/issues/$ISSUE_ID" \
+          echo "Fetching State transition: $STATE"
+          ISSUE_JSON="$(curl --fail-with-body --silent --show-error \
+            --url "$YOUTRACK_URL/api/issues/$ISSUE_ID?fields=customFields(id,name,%24type,possibleEvents(id,presentation,%24type))" \
             --header "Authorization: Bearer $YOUTRACK_TOKEN" \
+            --header "Accept: application/json")"
+          STATE_FIELD_ID="$(printf '%s' "$ISSUE_JSON" | jq -r '.customFields[] | select(.name == "State") | .id' | head -n 1)"
+          EVENT="$(printf '%s' "$ISSUE_JSON" | jq -c --arg state "$STATE" '.customFields[] | select(.name == "State") | .possibleEvents[] | select(.presentation == $state) | {id, presentation, "$type"}' | head -n 1)"
+          if [ -z "$EVENT" ]; then
+            echo "Transition is unavailable; the issue may already be in the target state"
+            exit 0
+          fi
+          PAYLOAD="$(jq -cn --arg id "$STATE_FIELD_ID" --argjson event "$EVENT" '{id: $id, "$type": "StateMachineIssueCustomField", event: $event}')"
+          echo "Applying YouTrack transition: $STATE"
+          curl --fail-with-body --silent --show-error --dump-header - --request POST \
+            --url "$YOUTRACK_URL/api/issues/$ISSUE_ID/fields/$STATE_FIELD_ID" \
+            --header "Authorization: Bearer $YOUTRACK_TOKEN" \
+            --header "Accept: application/json" \
             --header "Content-Type: application/json" \
-            --data "{\"customFields\":[{\"name\":\"State\",\"\$type\":\"StateIssueCustomField\",\"value\":{\"name\":\"$STATE\"}}]}"
+            --data-raw "$PAYLOAD"
